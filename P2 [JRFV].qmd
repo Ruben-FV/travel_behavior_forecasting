@@ -1,0 +1,384 @@
+---
+title: "P2: The Effect of Parking Space on Vehicle Availability"
+format: html
+editor: visual
+---
+
+## Introduction
+
+The purpose of this project is twofold. First, it aims to investigate how the results obtained from the base model (with new train and test datasets) compare against the Boston Region model. Second, it examines the effect of homeownership on vehicle availability. To achieve this, the variable *HOMEOWN* is incorporated into the original model.
+
+There are several reasons why homeownership might explain vehicle availability. One is that, by having more disposable income after rent (i.e., discretionary income), homeowners are more likely to afford additional vehicle leases or have savings to purchase more vehicles (note that the sole effect of net income is already considered in the base model). Another reason is that homeowners may have cheaper access to parking compared to renters, who often must pay an additional fee for each extra parking space they require.
+
+## Libraries
+
+The relevant libraries for this project are:
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(here)
+library(mlogit)
+library(knitr)
+library(caret)
+```
+
+## Helper Functions and Datasets
+
+We will employ some helper functions for the analysis of household and personal data from the 2017 National Household Travel Survey:
+
+```{r}
+# Helper functions:
+here("code",
+     "mlogit_helpers.R") |>
+  source()
+'%!in%' <- function(x,y)!('%in%'(x,y))
+
+# Load datasets:
+## Household data:
+hh_data <- here("data",
+                "NHTS",
+                "hhpub.csv") |>
+  read_csv(show_col_types = FALSE)
+## Personal data:
+person_data <- here("data",
+                    "NHTS",
+                    "perpub.csv") |>
+  read_csv(show_col_types = FALSE)
+```
+
+## Variable Selection
+
+Next, we select the relevant variables for the analysis:
+
+```{r}
+# Household dataset variables:
+hh_data <- hh_data |>
+  select(HOMEOWN, # This is the new variable
+         HBHUR, # This is a new variable that will be used as a control
+         WRKCOUNT,
+         DRVRCNT,
+         HHVEHCNT,
+         HHSIZE,
+         NUMADLT,
+         HHFAMINC,
+         HBPPOPDN,
+         HOUSEID)
+
+# Personal dataset variables:
+person_data <- person_data |>
+  select(HOUSEID,
+         R_AGE,
+         WORKER,
+         DRIVER)
+```
+
+## Outcome & Predictors
+
+Now, we modify the variables to assign relevant categories for better interpretation:
+
+```{r}
+# Outcome - vehicle availability:
+hh_data <- hh_data |>
+  mutate(veh_avail = case_when(HHVEHCNT == 0 ~ "Zero",
+                               DRVRCNT > HHVEHCNT ~ "Insuff.",
+                               TRUE ~ "Suff."))
+# Predictor - Number of children:
+hh_data <- hh_data |>
+  mutate(n_child = HHSIZE - NUMADLT)
+
+# Predictor - Number of seniors:
+n_seniors <- person_data |>
+  mutate(is_senior = R_AGE > 64) |>
+  group_by(HOUSEID) |>
+  summarise(n_seniors = sum(is_senior))
+
+hh_data <- hh_data |>
+  left_join(n_seniors)
+
+# Predictor - Presence of third driver:
+hh_data <- hh_data |>
+  mutate(three_drivers = DRVRCNT > 2)
+
+# Predictor - Number of drivers beyond 2:
+hh_data <- hh_data |>
+  mutate(n_extra_drivers = ifelse(three_drivers, DRVRCNT - 2, 0))
+
+# Predictor - Income:
+hh_data <- hh_data |>
+  mutate(HHFAMINC = as.numeric(HHFAMINC)) |>
+  filter(HHFAMINC > 0) |>
+  mutate(income = case_when(HHFAMINC < 4 ~ "low",
+                             HHFAMINC < 5 & HHSIZE > 1 ~ "low",
+                             HHFAMINC < 6 & HHSIZE > 3 ~ "low",
+                             HHFAMINC < 7 & HHSIZE > 5 ~ "low",
+                             HHFAMINC < 8 & HHSIZE > 7 ~ "low",
+                             HHFAMINC > 8 ~ "high",
+                            TRUE ~ "medium")) |>
+    mutate(income = factor(income, levels = c("medium", "low", "high")))
+
+# Predictor - Non-worker driver:
+non_work_driver <- person_data |>
+  mutate(non_work_driver = WORKER == "02" & DRIVER == "01") |>
+  group_by(HOUSEID) |>
+  summarise(non_work_driver = max(non_work_driver))
+
+hh_data <- hh_data |>
+  left_join(non_work_driver)
+
+# Predictor - Density:
+hh_data <- hh_data |>
+  filter(HBPPOPDN > 0) |>
+  mutate(density = case_when(HBPPOPDN < 7000 ~ "Low",
+                             HBPPOPDN < 10000 ~ "High",
+                             TRUE ~ "Medium"))
+```
+
+We will categorize the new variable, HOMEOWN, in two categories "Owner" and "Not_Owner":
+
+```{r}
+hh_data <- hh_data |>
+  mutate(owner = case_when(HOMEOWN == "01" ~ "Owner",
+                               TRUE ~ "Not_Owner"))
+```
+
+The same is done for the control variable, HBHUR, which will be categorized as "Urban" and "Not_Urban":
+
+```{r}
+hh_data <- hh_data |>
+  mutate(urban = case_when(HBHUR == "U" ~ "Urban",
+                               TRUE ~ "Not_Urban"))
+```
+
+## Data Preparation
+
+The next step is to keep only the relevant variables for the analysis, create the training and test datasets, and modify their structure for the mlogit package:
+
+```{r}
+# Variable selection:
+hh_data <- hh_data |>
+  select(HOUSEID,
+         veh_avail,
+         WRKCOUNT,
+         n_child,
+         n_seniors,
+         n_extra_drivers,
+         three_drivers,
+         non_work_driver,
+         income,
+         density,
+         owner, # This is the new variable
+         urban) # This is the new control variable
+
+# Training and test datasets: 
+set.seed(14031997) # set to my birthday
+
+hh_data_train_ids <- sample(hh_data$HOUSEID, 
+                        size = ceiling(nrow(hh_data)/2))
+
+hh_data_train <- hh_data |>
+  filter(HOUSEID %in% hh_data_train_ids)
+
+hh_data_test <- hh_data |>
+  filter(HOUSEID %!in% hh_data_train_ids)
+
+# DFIX datasets:
+veh_dfidx_train <- fn_make_dfidx(hh_data_train,
+                                "HOUSEID",
+                                "veh_avail")
+
+veh_dfidx_test <- fn_make_dfidx(hh_data_test,
+                                "HOUSEID",
+                                "veh_avail")
+```
+
+## Model Estimation
+
+Finally, we proceed to estimate the first model, which is identical in structure to the base model:
+
+```{r}
+# Model:
+model_veh <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      income +
+                      density | 0,
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+
+# Summary:
+summary(model_veh)
+```
+
+Now let's look at the measures of fit for this base model:
+
+```{r}
+# Probabilites:
+predicts_test <- predict(model_veh, veh_dfidx_test) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data_test)
+
+# Assign predictions:
+predicts_test <- predicts_test |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff."))
+
+# Match with original dataset:
+predicts_test <- predicts_test |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+
+# Construct the confusion matrix:
+confusionMatrix(data = predicts_test$most_likely,
+                reference = predicts_test$veh_avail)
+```
+
+## The Effect of Homeownership
+
+Now, let's analyze what happens when we incorporate homeownership into the model:
+
+```{r}
+# New model:
+model_veh_owner <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      income +
+                      density + 
+                      owner | 0, # New variable
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+
+# Summary:
+summary(model_veh_owner)
+```
+
+This model shows that, *ceteris paribus*, homeownership decreases the household utility of both having insufficient vehicles (-0.84) and having zero vehicles (-1.60). This indicates that homeowner households are less likely to choose to have an insufficient number of vehicles, as expected.
+
+The effect of the new variable on model measures of fit is the following:
+
+```{r}
+# Probabilites:
+predicts_test_owner <- predict(model_veh_owner, veh_dfidx_test) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data_test)
+
+# Assign predictions:
+predicts_test_owner <- predicts_test_owner |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff."))
+
+# Match with original dataset:
+predicts_test_owner <- predicts_test_owner |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+
+# Construct the confusion matrix:
+confusionMatrix(data = predicts_test_owner$most_likely,
+                reference = predicts_test_owner$veh_avail)
+```
+
+In general, the new model delivers roughly the same measures of fit and accuracy at predicting zero vehicle availability with respect to the class base model.
+
+## Testing for Omitted Variable Bias
+
+One could argue that the identified effect of homeownership is subject to omitted variable bias. This would be the case if another variable is highly correlated with both homeownership and vehicle availability. For example, one might believe that homeownership is less common in urban settings, as property prices are often higher than in rural or suburban areas. At the same time, urban households could reasonably be expected to live closer to employment and education centers, making them less likely to be vehicle-sufficient. This, in turn, would mean that the estimated coefficients for homeownership may be overstated.
+
+To test whether homeownership has an independent effect from urban residency, we will add the "urban" control to the last specification:
+
+```{r}
+# New model with control:
+model_veh_owner_control <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      income +
+                      density + 
+                      owner + # New variable
+                      urban| 0, # Control
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+
+# Summary:
+summary(model_veh_owner_control)
+```
+
+The results indicate that while the "urban" variable provides explanatory evidence for vehicle availability in the expected direction (i.e., urban households are more likely to be vehicle-insufficient), its inclusion does not alter the effect of homeownership on the dependent variable. Hence, this model provides evidence that homeownership has an independent effect from urban status.
+
+The addition of the "urban" control, however, does not increase the accuracy of the model significantly but reduces its ability to identify zero-vehicle households correctly:
+
+```{r}
+# Probabilites:
+predicts_test_owner_control <- predict(model_veh_owner_control, veh_dfidx_test) |>
+  as.data.frame() |>
+  rownames_to_column("HOUSEID") |>
+  mutate(HOUSEID = as.numeric(HOUSEID)) |>
+  left_join(hh_data_test)
+
+# Assign predictions:
+predicts_test_owner_control <- predicts_test_owner_control |>
+  mutate(most_likely = case_when((Suff. > Insuff.) & (Suff. > Zero) ~ "Suff.",
+                                 (Zero > Insuff.) & (Zero > Suff.) ~ "Zero",
+                                 TRUE ~ "Insuff."))
+
+# Match with original dataset:
+predicts_test_owner_control <- predicts_test_owner_control |>
+  mutate(most_likely = factor(most_likely, 
+                              levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(veh_avail = factor(veh_avail,
+                            levels = c("Suff.", "Insuff.", "Zero"))) |>
+  mutate(correct = veh_avail == most_likely)
+
+# Construct the confusion matrix:
+confusionMatrix(data = predicts_test_owner_control$most_likely,
+                reference = predicts_test_owner_control$veh_avail)
+```
+
+## Explaining the identified Effect
+
+If homeownership increases vehicle availability through its income effect (i.e., by increasing discretionary income), we would expect its effect to decrease as household income rises, since housing-related expenses cease to be a barrier to vehicle acquisition beyond a certain income level.
+
+To test this, we could include an interaction term between "owner" and "income" in the new model:
+
+```{r}
+# New model 2:
+model_veh_owner2 <- mlogit(choice ~ 0 | 
+                      WRKCOUNT +
+                      n_child +
+                      n_seniors +
+                      n_extra_drivers +
+                      three_drivers + 
+                      non_work_driver +
+                      density + 
+                      income*owner | 0, # Interaction term
+                           veh_dfidx_train,
+                           reflevel = "Suff.")
+
+# Summary:
+summary(model_veh_owner2)
+```
+
+The only two significant interactions suggest that homeownership has both a stronger effect for low-income households and a weaker effect for high-income households on the likelihood of having insufficient vehicles. These two results seem to imply that homeownership does affect (at least partially) vehicle availability through discretionary income. However, the fact that the coefficients for homeownership remain significant and fairly close to their original values suggests that other factors, such as parking availability, may also explain the effect of homeownership on vehicle availability.
+
+## End of Project
